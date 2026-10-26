@@ -20,7 +20,9 @@ DEFAULT = dict(min_value=200_000_000, min_history=210, min_group=3,
                min_coverage=0.70, group_threshold=60, stock_threshold=65,
                top_n=10, per_group=3, stop_pct=0.05, capital=1_000_000,
                risk_pct=0.005, max_position_pct=0.10, max_basket_pct=0.30,
-               lot=100, request_interval=1.1, history_sessions=280)
+               lot=100, request_interval=1.1, history_sessions=280,
+               ranking_top_n=500, ranking_history_days=26, ranking_min_value=0,
+               rotation_min_change=3, rotation_rate_change=0.05)
 
 
 def atomic_text(path, content):
@@ -47,6 +49,13 @@ def config(path):
             raise ValueError(f'{k} は正数が必要です')
     if c['min_history'] < 210 or c['history_sessions'] < c['min_history'] + 5:
         raise ValueError('min_history>=210、history_sessions>=min_history+5 が必要です')
+    for k in ['ranking_top_n', 'ranking_history_days', 'rotation_min_change']:
+        if not isinstance(c[k], int) or c[k] <= 0:
+            raise ValueError(f'{k} は正の整数が必要です')
+    if c['ranking_history_days'] < 6 or c['ranking_min_value'] < 0 or not 0 < c['rotation_rate_change'] <= 1:
+        raise ValueError('ランキング設定が範囲外です')
+    if c['history_sessions'] < c['ranking_history_days'] + 20:
+        raise ValueError('ランキング比較に必要な取得日数が不足しています')
     return c
 
 
@@ -334,8 +343,172 @@ def md_table(df, columns):
     return '| '+' | '.join(columns.values())+' |\n|'+ '|'.join(['---']*len(names))+'|\n'+'\n'.join('| '+' | '.join(cell(r.get(k,'')) for k in names)+' |' for _,r in df.iterrows())+'\n'
 
 
+def ranking_rotation(raw, master, sessions, asof, c):
+    """直近26営業日の1/5/20日ランキング。固定の比較母集団で構成変化を測る。"""
+    days = [d for d in sessions if d <= asof]
+    lookback = c['ranking_history_days']
+    required = lookback + 20
+    if len(days) < required:
+        raise ValueError(f'ランキングには最低{required}営業日のデータが必要です')
+    days = days[-required:]
+    data = validate(raw)
+    data = data[data.Date.isin(days) & data.Code.isin(master.Code)]
+    def panel(col):
+        return data.pivot(index='Date', columns='Code', values=col).reindex(days)
+    close, factor, value = panel('C'), panel('AdjFactor'), panel('Va')
+    # 比較期間の全日で観測できる共通母集団。IPO/売買停止/未取得による見かけの交代を回避。
+    good = (close.notna().all() & factor.notna().all() & value.gt(0).all())
+    codes = list(good[good].index)
+    coverage = len(codes) / len(master)
+    if coverage < c['min_coverage']:
+        raise ValueError(f'ランキング比較母集団の充足率 {coverage:.1%}。基準未達です')
+    close, factor, value = close[codes], factor[codes], value[codes]
+    cumulative = factor.iloc[::-1].cumprod().iloc[::-1] / factor
+    close = close * cumulative
+    liquidity = value.shift(1).rolling(20).mean()
+    flow = value.rolling(5).mean() / value.shift(5).rolling(20).mean()
+    means20 = close.rolling(20).mean()
+    dates = days[-lookback:]
+    mapping = master.set_index('Code')
+    histories, summaries, latest = [], [], {}
+    sector_codes = {name:set(g.Code) & set(codes) for name,g in master.groupby('S33Nm')}
+    for window in [1,5,20]:
+        returns = close.pct_change(window, fill_method=None)
+        memberships, frames = {}, {}
+        for d in dates:
+            r = returns.loc[d]
+            allowed = r.gt(0) & liquidity.loc[d].ge(c['ranking_min_value'])
+            ranked = pd.DataFrame({'Code': r.index[allowed], 'return': r[allowed].values})
+            ranked = ranked.sort_values(['return','Code'], ascending=[False,True]).head(c['ranking_top_n']).reset_index(drop=True)
+            ranked['rank'] = np.arange(1,len(ranked)+1)
+            ranked['Date'],ranked['period'] = d,window
+            ranked['CoName'] = ranked.Code.map(mapping.CoName)
+            ranked['S33Nm'] = ranked.Code.map(mapping.S33Nm)
+            memberships[d] = set(ranked.Code)
+            frames[d] = ranked
+        # 連続登場は保存前歴がなくても価格履歴から再構成。最大lookback日で打ち切り。
+        for i,d in enumerate(dates):
+            frame = frames[d]
+            before = memberships[dates[i-1]] if i else None
+            frame['entry'] = frame.Code.map(lambda code: '比較履歴なし' if before is None else ('新規' if code not in before else '継続'))
+            streaks = {}
+            for code in memberships[d]:
+                n=0
+                for prior in reversed(dates[:i+1]):
+                    if code not in memberships[prior]:
+                        break
+                    n+=1
+                streaks[code]=n
+            frame['streak'] = frame.Code.map(streaks)
+            frame['streak_capped'] = frame.streak.eq(i+1)
+            histories.append(frame)
+        latest[window] = frames[asof].copy()
+        today, yesterday, before5 = [memberships[d] for d in [dates[-1],dates[-2],dates[-6]]]
+        n_universe = len(codes)
+        for sector, members in sector_codes.items():
+            n=len(members)
+            if n==0:
+                continue
+            now = members & today
+            prev = members & yesterday
+            old = members & before5
+            rate=len(now)/n
+            old_rate=len(old)/n
+            market_rate=len(today)/n_universe
+            concentration=rate/market_rate if market_rate>0 else 0.0
+            concentration5=(len(old)/n)/(len(before5)/n_universe) if before5 else 0.0
+            entrants=now-prev
+            exits=prev-now
+            valid_liquid=[code for code in members if liquidity.loc[asof,code]>=c['min_value']]
+            # 薄商いの急騰だけでは確認済み転換にしない。
+            sector_flow=float(flow.loc[asof,valid_liquid].median()) if valid_liquid else np.nan
+            sector_ret=float(returns.loc[asof,list(members)].median())
+            b20=float((close.loc[asof,list(members)]>means20.loc[asof,list(members)]).mean())
+            liquid_leaders=len(set(valid_liquid)&now)
+            recent_rates=[len(members & memberships[d])/n for d in dates[-3:]]
+            sustained=all(rate_ > old_rate for rate_ in recent_rates)
+            streak3=sum(int(frames[asof].set_index('Code').loc[code,'streak'])>=3 for code in now)
+            delta=len(now)-len(old)
+            delta_rate=rate-old_rate
+            # セクター規模、相対集中、3日持続、代金の裏付けを同時確認。
+            if n < c['min_group']:
+                signal='判定不足'
+            elif delta<=-c['rotation_min_change'] and delta_rate<=-c['rotation_rate_change']:
+                signal='広がり縮小'
+            elif delta>=c['rotation_min_change'] and delta_rate>=c['rotation_rate_change'] and concentration>=1.2:
+                signal='転換確認候補' if sustained and sector_flow>=1.1 and liquid_leaders>=3 and sector_ret>0 else '転換の兆し'
+            elif concentration>=1.2 and streak3>=3 and sector_ret>0:
+                signal='上位定着'
+            else:
+                signal='監視'
+            summaries.append(dict(period=window, sector=sector, universe=n, top_count=len(now),
+                                  count_prev=len(prev),count_5ago=len(old),delta1=len(now)-len(prev),delta5=delta,
+                                  rate=rate,rate_delta5=delta_rate,concentration=concentration,
+                                  concentration_delta5=concentration-concentration5,
+                                  entrants=len(entrants),exits=len(exits),streak3=streak3,
+                                  liquid_leaders=liquid_leaders,flow5=sector_flow,sector_return=sector_ret,
+                                  breadth20=b20,sustained3=sustained,signal=signal,
+                                  leaders=' / '.join(frames[asof].loc[frames[asof].Code.isin(members),'Code'].head(5)),
+                                  entrants_codes=' / '.join(sorted(entrants)), exits_codes=' / '.join(sorted(exits))))
+    sectors=pd.DataFrame(summaries)
+    # 過熱度は転換の監視とは別軸。売買候補の判定を上書きしない。
+    sectors=sectors.sort_values(['period','concentration','delta5'],ascending=[True,False,False])
+    combined=[]
+    for sector,g in sectors.groupby('sector'):
+        signals=dict(zip(g.period,g.signal))
+        turn=[p for p in [1,5,20] if signals.get(p)=='転換確認候補']
+        signs=[p for p in [1,5,20] if signals.get(p)=='転換の兆し']
+        declines=[p for p in [1,5,20] if signals.get(p)=='広がり縮小']
+        if len(turn)>=2:
+            verdict='複数期間で転換確認候補'
+        elif turn:
+            verdict='転換確認候補'
+        elif signs:
+            verdict='転換の兆し'
+        elif declines:
+            verdict='広がり縮小'
+        elif any(s=='上位定着' for s in signals.values()):
+            verdict='上位定着'
+        else:
+            verdict='監視'
+        if (turn or signs) and declines:
+            verdict='期間で方向不一致'
+        combined.append(dict(sector=sector, signal=verdict, **{f'signal_{p}d':signals.get(p,'判定不足') for p in [1,5,20]}))
+    overview=pd.DataFrame(combined)
+    priority={'複数期間で転換確認候補':0,'転換確認候補':1,'転換の兆し':2,'期間で方向不一致':3,'上位定着':4,'広がり縮小':5,'監視':6}
+    overview['_order']=overview.signal.map(priority)
+    overview=overview.sort_values(['_order','sector']).drop(columns='_order')
+    return latest, pd.concat(histories,ignore_index=True), sectors, overview, coverage
+
+
+def ranking_report(latest, sectors, overview, c, coverage):
+    body=f'''\n## 上昇率上位{c['ranking_top_n']}銘柄から読む業種転換\n
+1日・5日・20日の上昇率をそれぞれ順位付け。プラス騰落銘柄のみを最大{c['ranking_top_n']}件抽出します。
+比較母集団の充足率 {coverage:.1%}。直近{c['ranking_history_days']+20}営業日を連続観測できた銘柄を共通母集団にし、IPO・欠損による見かけの増減を抑えています。
+業種は分析日現在の分類で過去分も再集計します。履歴上の当時の構成・分類を復元したバックテストではありません。
+
+'''
+    body+=md_table(overview,{'sector':'業種','signal':'総合監視判定','signal_1d':'1日上昇率','signal_5d':'5日上昇率','signal_20d':'20日上昇率'})
+    for period in [1,5,20]:
+        body+=f'\n### {period}日上昇率ランキングの業種別内訳\n\n'
+        table=sectors[sectors.period.eq(period)].copy()
+        table['rate_pct']=table.rate*100
+        table['change_pp']=table.rate_delta5*100
+        body+=md_table(table,{'sector':'業種','universe':'母数','top_count':'ランク内','delta1':'前日比','delta5':'5日前比','rate_pct':'登場率%','change_pp':'登場率差pt','concentration':'集中倍率','entrants':'新規','exits':'退出','streak3':'3日連続','flow5':'代金倍率','signal':'判定','leaders':'上位コード'})
+    body+='''
+- 登場率＝業種内ランク入り銘柄数÷業種の共通母集団。集中倍率＝業種登場率÷市場全体登場率。1倍超は相対的な偏りを表します。
+- 「転換の兆し」は5日前比の登場銘柄数と登場率の増加、集中倍率1.2倍以上を条件とします。「転換確認候補」はさらに3日間の広がり、流動性のある主導株3銘柄以上、代金倍率1.1以上、業種騰落率中央値プラスを確認します。
+- 日次ランキングに新規登場しても「上場後初」ではありません。連続登場日数は再構成期間内の下限値です。streak_capped=Trueなら、それ以前から続いている可能性があります。
+- 強い業種からの押し出しでも順位は下がるため、「広がり縮小」は資金流出や株価下落の断定ではありません。既存の旬スコア・チャート・材料と併用してください。
+- 転換候補は監視対象です。既存のエントリー条件・過熱回避・損切りの規律を維持します。
+'''
+    return body
+
+
 def report(master, raw, asof, sessions, themes, c, out, demo=False):
     f, coverage=features(raw,master,asof,sessions,c)
+    sessions=[d for d in sessions if d<=asof]
+    latest, rank_history, rotation, rotation_overview, rank_coverage = ranking_rotation(raw,master,sessions,asof,c)
     old_date=sessions[-6]
     prev,_=features(raw,master,old_date,sessions,c)
     groups=stages(group_table(f,master,themes,c),group_table(prev,master,themes,c),c)
@@ -347,6 +520,10 @@ def report(master, raw, asof, sessions, themes, c, out, demo=False):
     out=Path(out)/asof
     out.mkdir(parents=True,exist_ok=True)
     for name,frame in [('groups',groups),('stocks',stocks),('picks',picks)]:
+        atomic_text(out/(name+'.csv'),frame.to_csv(index=False))
+    for period,frame in latest.items():
+        atomic_text(out/f'ranking_{period}d.csv',frame.to_csv(index=False))
+    for name,frame in [('ranking_history',rank_history),('sector_rotation',rotation),('rotation_overview',rotation_overview)]:
         atomic_text(out/(name+'.csv'),frame.to_csv(index=False))
     title='【架空データ・動作例】' if demo else ''
     body=f'''# {title}旬レポート {asof}
@@ -375,8 +552,9 @@ def report(master, raw, asof, sessions, themes, c, out, demo=False):
 - 決算・増資・信用規制・材料の事実確認は別途必要。ニュース/SNS解析と保有建玉監視は未実装です。
 - 閾値・点数は仮説であり、統計的優位性・収益性は未検証。バックテスト結果ではありません。
 '''
+    body+=ranking_report(latest,rotation,rotation_overview,c,rank_coverage)
     atomic_text(out/'report.md',body)
-    metadata=dict(asof=asof, demo=demo, coverage=coverage, config=c, stocks=len(f), picks=len(picks),
+    metadata=dict(version='2.0', asof=asof, demo=demo, coverage=coverage, ranking_coverage=rank_coverage, config=c, stocks=len(f), picks=len(picks),
                   created_at=datetime.now(ZoneInfo('Asia/Tokyo')).isoformat())
     atomic_text(out/'metadata.json',json.dumps(metadata,ensure_ascii=False,indent=2))
     print(f'出力: {out}/report.md / 候補 {len(picks)}銘柄')
