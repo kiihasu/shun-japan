@@ -1,0 +1,40 @@
+name: Shun Backtest
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  backtest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - run: pip install -r requirements.txt
+
+      - uses: actions/cache@v4
+        with:
+          path: cache
+          key: shun-backtest-${{ github.run_id }}
+          restore-keys: |
+            shun-backtest-
+            shun-prices-v1-
+
+      - name: Backtest 60 sessions
+        env:
+          JQUANTS_API_KEY: ${{ secrets.JQUANTS_API_KEY }}
+        run: python backtest.py --test-days 60
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: shun-backtest-${{ github.run_id }}
+          path: backtest_results/
+          if-no-files-found: error
