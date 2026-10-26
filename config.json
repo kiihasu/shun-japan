@@ -8,11 +8,16 @@
   "top_n": 10,
   "per_group": 3,
   "stop_pct": 0.05,
-  "capital": 1000000,
+  "capital": 10000000,
   "risk_pct": 0.005,
   "max_position_pct": 0.1,
   "max_basket_pct": 0.3,
   "lot": 100,
   "request_interval": 1.1,
-  "history_sessions": 280
+  "history_sessions": 280,
+  "ranking_top_n": 500,
+  "ranking_history_days": 26,
+  "ranking_min_value": 0,
+  "rotation_min_change": 3,
+  "rotation_rate_change": 0.05
 }
