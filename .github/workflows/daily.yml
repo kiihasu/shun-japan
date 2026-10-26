@@ -1,0 +1,46 @@
+name: Shun Japan Daily
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '40 21 * * 0-4'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: shun-daily
+  cancel-in-progress: false
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+
+      - run: pip install -r requirements.txt
+
+      - uses: actions/cache@v4
+        with:
+          path: cache
+          key: shun-prices-v1-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: shun-prices-v1-
+
+      - name: Scan
+        env:
+          JQUANTS_API_KEY: ${{ secrets.JQUANTS_API_KEY }}
+        run: python shun.py
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: shun-report-${{ github.run_id }}
+          path: reports/
+          retention-days: 30
+          if-no-files-found: error
