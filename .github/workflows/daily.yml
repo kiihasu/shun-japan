@@ -36,7 +36,9 @@ jobs:
       - name: Scan
         env:
           JQUANTS_API_KEY: ${{ secrets.JQUANTS_API_KEY }}
-        run: python shun.py
+        run: |
+          python shun.py
+          python relative_strength.py
 
       - uses: actions/upload-artifact@v4
         with:
