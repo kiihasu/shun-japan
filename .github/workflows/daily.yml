@@ -3,10 +3,14 @@ name: Shun Japan Daily
 on:
   workflow_dispatch:
   schedule:
-    - cron: '40 21 * * 0-4'
+    # 日本時間 月～金 16:35、16:45、16:55
+    - cron: '35,45,55 7 * * 1-5'
+    # 日本時間 月～金 17:05～20:55、10分間隔
+    - cron: '5,15,25,35,45,55 8-11 * * 1-5'
 
 permissions:
   contents: read
+  actions: read
 
 concurrency:
   group: shun-daily
@@ -27,22 +31,183 @@ jobs:
 
       - run: pip install -r requirements.txt
 
+      - name: Check today's data
+        id: ready
+        env:
+          JQUANTS_API_KEY: ${{ secrets.JQUANTS_API_KEY }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          python - <<'PY'
+          import json
+          import os
+          import subprocess
+          from datetime import datetime, timedelta
+          from zoneinfo import ZoneInfo
+
+          import pandas as pd
+          from shun import JQuants
+
+          today = datetime.now(ZoneInfo("Asia/Tokyo")).date()
+          date_text = today.isoformat()
+          report_name = f"shun-report-{date_text}"
+
+          with open(os.environ["GITHUB_OUTPUT"], "a") as output:
+              output.write(f"date={date_text}\n")
+              output.write("ready=false\n")
+
+          # 保存済みの同日レポートがあれば終了。
+          endpoint = (
+              f"repos/{os.environ['GITHUB_REPOSITORY']}"
+              f"/actions/artifacts?name={report_name}&per_page=100"
+          )
+          result = subprocess.run(
+              ["gh", "api", endpoint],
+              check=True,
+              capture_output=True,
+              text=True,
+          )
+          artifacts = json.loads(result.stdout)["artifacts"]
+          if any(
+              item["name"] == report_name and not item["expired"]
+              for item in artifacts
+          ):
+              print(f"{date_text}: レポート保存済み。")
+              raise SystemExit(0)
+
+          api = JQuants(1.5)
+          calendar = api.get(
+              "markets/calendar",
+              **{
+                  "from": (today - timedelta(days=40)).isoformat(),
+                  "to": date_text,
+              },
+          )
+          if calendar.empty:
+              raise RuntimeError("取引カレンダーを取得できません。")
+
+          sessions = sorted(
+              calendar.loc[
+                  calendar["HolDiv"].astype(str).isin(["1", "2"]),
+                  "Date",
+              ].astype(str).unique()
+          )
+          if date_text not in sessions:
+              print(f"{date_text}: 株式市場の休業日。")
+              raise SystemExit(0)
+          if len(sessions) < 2:
+              raise RuntimeError("前営業日を確認できません。")
+
+          def valid_prices(frame, expected_date):
+              required = {"Date", "Code", "C"}
+              if frame.empty or not required.issubset(frame.columns):
+                  return set()
+              close = pd.to_numeric(frame["C"], errors="coerce")
+              valid = (
+                  frame["Date"].astype(str).eq(expected_date)
+                  & close.gt(0)
+                  & close.lt(float("inf"))
+              )
+              return set(frame.loc[valid, "Code"].astype(str))
+
+          previous_date = sessions[-2]
+          previous = api.get(
+              "equities/bars/daily", date=previous_date
+          )
+          current = api.get(
+              "equities/bars/daily", date=date_text
+          )
+          previous_codes = valid_prices(previous, previous_date)
+          current_codes = valid_prices(current, date_text)
+
+          if not previous_codes:
+              raise RuntimeError("前営業日の株価を確認できません。")
+
+          coverage = len(
+              previous_codes & current_codes
+          ) / len(previous_codes)
+          print(f"前営業日の有効銘柄に対する取得率: {coverage:.2%}")
+
+          if coverage < 0.99:
+              print("当日の株価が不足。次回の定期実行で再確認します。")
+              raise SystemExit(0)
+
+          # 相対強度に使うETFの当日終値も確認。
+          for code in ("13210", "25160"):
+              prices = api.get(
+                  "equities/bars/daily",
+                  code=code,
+                  date=date_text,
+              )
+              if code not in valid_prices(prices, date_text):
+                  print(f"ETF {code} の当日データ待ち。")
+                  raise SystemExit(0)
+
+          topix = api.get(
+              "indices/bars/daily/topix",
+              **{"from": date_text, "to": date_text},
+          )
+          if topix.empty or not {"Date", "C"}.issubset(topix.columns):
+              print("TOPIXの当日データ待ち。")
+              raise SystemExit(0)
+
+          close = pd.to_numeric(topix["C"], errors="coerce")
+          valid = (
+              topix["Date"].astype(str).eq(date_text)
+              & close.gt(0)
+              & close.lt(float("inf"))
+          )
+          if not valid.any():
+              print("TOPIXの当日終値待ち。")
+              raise SystemExit(0)
+
+          with open(os.environ["GITHUB_OUTPUT"], "a") as output:
+              output.write("ready=true\n")
+          print(f"{date_text}: データ確認完了。分析を開始します。")
+          PY
+
       - uses: actions/cache@v4
+        if: steps.ready.outputs.ready == 'true'
         with:
           path: cache
           key: shun-prices-v1-${{ github.run_id }}-${{ github.run_attempt }}
           restore-keys: shun-prices-v1-
 
       - name: Scan
+        if: steps.ready.outputs.ready == 'true'
         env:
           JQUANTS_API_KEY: ${{ secrets.JQUANTS_API_KEY }}
+          SCAN_DATE: ${{ steps.ready.outputs.date }}
         run: |
-          python shun.py
-          python relative_strength.py
+          python shun.py --date "$SCAN_DATE"
+          python relative_strength.py --date "$SCAN_DATE"
+
+      - name: Verify relative strength report
+        if: steps.ready.outputs.ready == 'true'
+        env:
+          SCAN_DATE: ${{ steps.ready.outputs.date }}
+        run: |
+          python - <<'PY'
+          import os
+          import re
+          from pathlib import Path
+
+          report = (
+              Path("reports")
+              / os.environ["SCAN_DATE"]
+              / "relative_strength_report.md"
+          )
+          text = report.read_text(encoding="utf-8")
+          counts = re.findall(r"判定可能 (\d+) /", text)
+          if len(counts) != 3 or any(int(n) == 0 for n in counts):
+              raise RuntimeError(
+                  "3つの比較対象すべての相対強度を計算できませんでした。"
+              )
+          PY
 
       - uses: actions/upload-artifact@v4
+        if: steps.ready.outputs.ready == 'true'
         with:
-          name: shun-report-${{ github.run_id }}
-          path: reports/
+          name: shun-report-${{ steps.ready.outputs.date }}
+          path: reports/${{ steps.ready.outputs.date }}/
           retention-days: 30
           if-no-files-found: error
