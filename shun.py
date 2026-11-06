@@ -100,7 +100,7 @@ class JQuants:
 def target_date(api, now, explicit=None):
     # 朝は前営業日。20時以前は当日を使わず、未確定データを避ける。
     upper = pd.Timestamp(explicit).date() if explicit else now.date() - timedelta(days=int(now.hour < 20))
-    if upper > now.date() or (upper == now.date() and now.hour < 20):
+    if upper > now.date() or (upper == now.date() and now.hour < 20 and not explicit):
         raise ValueError('当日20時前または未来日付の終値は使用できません')
     cal = api.get('markets/calendar', **{'from': str(upper - timedelta(days=550)), 'to': str(upper)})
     if cal.empty:
