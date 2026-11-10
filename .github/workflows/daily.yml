@@ -2,12 +2,8 @@ name: Shun Japan Daily
 
 on:
   workflow_dispatch:
-  schedule:
-    # 日本時間 月～金 16:35、16:45、16:55
-    - cron: '35,45,55 7 * * 1-5'
-    # 日本時間 月～金 17:05～20:55、10分間隔
-    - cron: '5,15,25,35,45,55 8-11 * * 1-5'
-
+    schedule:
+    - cron: '0 9 * * 1-5'
 permissions:
   contents: read
   actions: read
