@@ -3,12 +3,31 @@
 ETF results are uncorrected for distributions and are ALWAYS reference only.
 """
 import argparse
+import re
+from urllib.request import Request, urlopen
+from html import unescape
 from pathlib import Path
 import numpy as np
 import pandas as pd
 from shun import JQuants, config, live_data, atomic_text
 
 LOOKBACK = 252
+
+def nikkei_members(asof):
+    url = 'https://indexes.nikkei.co.jp/nkave/index/component?idx=nk225'
+    with urlopen(Request(url, headers={'User-Agent': 'ShunJapanDaily/1.0'}), timeout=25) as response:
+        html = response.read().decode('utf-8')
+    plain = unescape(re.sub(r'<[^>]+>', ' ', html))
+    match = re.search(r'更新日付[\s：:]*([0-9]{4}[.][0-9]{2}[.][0-9]{2})', plain)
+    if not match or match[1].replace('.', '-') != asof:
+        raise ValueError('対象日の日経225構成を確認できません')
+    cells = re.findall(r'<t[dh]\b[^>]*>(.*?)</t[dh]>', html, re.I | re.S)
+    codes = {re.sub(r'<[^>]+>', '', cell).strip() for cell in cells}
+    members = {code + '0' for code in codes if re.fullmatch(r'[0-9][0-9A-Z][0-9][0-9A-Z]', code)}
+    if len(members) != 225:
+        raise ValueError('日経225の225銘柄を確認できません')
+    return members
+
 
 def adjusted_close(frame, sessions):
     g = frame.copy()
@@ -21,9 +40,7 @@ def adjusted_close(frame, sessions):
     f = pd.to_numeric(g.AdjFactor, errors='coerce')
     # Do not invent missing observations or adjustment factors.
     good = f.notna() & np.isfinite(f) & (f > 0)
-    if not good.all():
-        return pd.Series(np.nan, index=sessions)
-    adj = f.iloc[::-1].cumprod().iloc[::-1] / f
+    adj = f.where(good).iloc[::-1].cumprod(skipna=False).iloc[::-1] / f
     return (c * adj).where(np.isfinite(c) & (c > 0))
 
 def signal(close, benchmark):
@@ -48,7 +65,7 @@ def signal(close, benchmark):
                 excess_pct=float((ratio.iloc[-1]/previous.iloc[-1]-1)*100),
                 stock_change_pct=float((close.iloc[-1]/close.iloc[-2]-1)*100))
 
-def make_report(master, raw, benchmarks, sessions, asof, out):
+def make_report(master, raw, benchmarks, sessions, asof, out, members=None):
     sessions = sorted(set(d for d in sessions if d <= asof))
     if len(sessions) < 253 or sessions[-1] != asof:
         raise ValueError('対象日まで最低253営業日が必要です')
@@ -59,26 +76,37 @@ def make_report(master, raw, benchmarks, sessions, asof, out):
     prices = {code: adjusted_close(g, sessions) for code,g in groups.items()
               if code in set(master.Code.astype(str))}
     lines = [f'# 相対強度52週高値レポート {asof}', '',
-             '上昇率ランキングとは独立。全対象普通株を3つの比較対象で判定。',
+             '上昇率ランキングとは独立。日経225採用は1321、グロースは2516、その他はTOPIXで個別に判定。',
              '本日の終値比率 > 本日を除く直前252営業日の最高比率（52週の近似）。同値は更新なし。',
              '株価は分割等を調整。配当は未調整。欠損日・履歴不足は判定不可。',
              'ETF代用は分配金未補正・参考判定です。指数そのものの高値更新とは異なります。',
              '分配落ちによる見かけの更新、費用、指数との乖離が含まれます。自動売買・通知機能はありません。',
              '新規・再更新は「前日は更新なし、当日は更新」を意味し、過去初の更新ではありません。', '']
     records=[]
+    if members is None:
+        lines += ['日経225構成を確認できず、プライム市場の比較先は判定保留。', '']
+    code = master.Code.astype(str)
+    market = master.Mkt.astype(str)
+    nikkei = code.isin(members or set())
+    unknown = (market == '0111') & (members is None)
+    if unknown.any():
+        lines += [f'比較先未確定 {int(unknown.sum())}銘柄（日経225構成未確認）。', '']
     for label, bench in benchmarks.items():
+        selected = nikkei if '1321' in label else ((market == '0113') & ~nikkei if '2516' in label else ~(nikkei | (market == '0113') | unknown))
+        subset = master.loc[selected]
+        counts = f'判定可能 0 / 対象 {len(subset)}銘柄。判定不能 {len(subset)}銘柄。'
         proxy = 'ETF' in label
         lines += [f'## {label}', '']
         if isinstance(bench, str):
-            lines += [f'取得失敗・判定不可: {bench}', '']; continue
+            lines += [f'{counts} 取得失敗・判定不可: {bench}', '']; continue
         if bench.index.duplicated().any():
-            lines += ['指数日付が重複しています。判定不可。', '']; continue
+            lines += [counts + ' 指数日付が重複しています。判定不可。', '']; continue
         b = pd.to_numeric(bench.reindex(sessions), errors='coerce')
         b = b.where(np.isfinite(b) & (b > 0))
         if b.iloc[-253:].isna().any():
-            lines += ['比較対象の253営業日分に欠損があります。判定不可（該当なしではありません）。', '']; continue
+            lines += [counts + ' 比較対象の253営業日分に欠損があります。', '']; continue
         eligible=0; hits=[]
-        for row in master.itertuples(index=False):
+        for row in subset.itertuples(index=False):
             code=str(row.Code); close=prices.get(code)
             result = None if close is None else signal(close,b)
             rec = dict(Date=asof,Code=code[:-1] if len(code)==5 and code.endswith('0') else code,
@@ -88,10 +116,10 @@ def make_report(master, raw, benchmarks, sessions, asof, out):
                 eligible+=1; rec.update(result)
                 if result['hit']: hits.append(rec)
             records.append(rec)
-        lines += [f'判定可能 {eligible} / 対象 {len(master)}銘柄。更新 {len(hits)}銘柄。', '']
+        lines += [f'判定可能 {eligible} / 対象 {len(subset)}銘柄。判定不能 {len(subset)-eligible}銘柄。更新 {len(hits)}銘柄。', '']
         if proxy: lines += ['**以下はETF分配金未補正の参考候補。実指数での更新を保証しません。**', '']
         if not hits:
-            lines += ['更新銘柄なし。', '']; continue
+            lines += ['判定可能な銘柄に更新なし。' if eligible else '判定可能な銘柄なし。', '']; continue
         hits.sort(key=lambda r:(-r['excess_pct'],r['Code']))
         lines += ['| コード | 銘柄 | 更新状況 | 旧高値超過率 | 株価前日比 |',
                   '|---|---|---|---:|---:|']
@@ -127,7 +155,12 @@ def main():
             benchmarks[label]=adjusted_close(t,sessions)
         except (ValueError,RuntimeError,KeyError,OSError) as e:
             benchmarks[label]=str(e)
-    dest=make_report(master,raw,benchmarks,sessions,asof,args.out)
+    try:
+        members = nikkei_members(asof)
+    except (OSError, ValueError) as error:
+        print(f'日経225構成取得不可: {error}')
+        members = None
+    dest=make_report(master,raw,benchmarks,sessions,asof,args.out,members)
     print(f'相対強度レポート: {dest}/relative_strength_report.md')
 
 if __name__=='__main__':
